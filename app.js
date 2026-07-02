@@ -10,6 +10,11 @@
   const STORAGE_KEY = "xinxiang:web:userState";
   const HISTORY_KEY = "xinxiang:web:history";
   const BLESSING_KEY = "xinxiang:web:blessings";
+  const CLIENT_ID_KEY = "xinxiang:web:clientId";
+  const CLOUDBASE_ENV_ID = "xinxiang-prod-d4g5phsz18ced9f57";
+  const INVITE_COLLECTION = "h5_charm_invites";
+  const REQUIRED_BLESSING_COUNT = 3;
+  const SYNC_POLL_INTERVAL = 4000;
   const app = document.getElementById("app");
 
   const WISH_THEME_PAGES = [
@@ -60,8 +65,164 @@
     result: null,
     isUnlocked: false,
     sentenceBlessingSent: false,
-    ownerId: ""
+    ownerId: "",
+    inviteId: "",
+    blessingCount: 0,
+    syncStatus: "idle",
+    syncError: ""
   };
+
+  const cloudSync = {
+    app: null,
+    db: null,
+    command: null,
+    readyPromise: null,
+    pollTimer: null
+  };
+
+  function createLocalId(prefix) {
+    const random = window.crypto && window.crypto.getRandomValues
+      ? Array.from(window.crypto.getRandomValues(new Uint32Array(2)), (value) => value.toString(36)).join("")
+      : Math.random().toString(36).slice(2, 14);
+    return `${prefix}_${Date.now().toString(36)}_${random}`;
+  }
+
+  function getClientId() {
+    let clientId = localStorage.getItem(CLIENT_ID_KEY);
+    if (!clientId) {
+      clientId = createLocalId("visitor");
+      localStorage.setItem(CLIENT_ID_KEY, clientId);
+    }
+    return clientId;
+  }
+
+  function ensureInviteIdentity() {
+    if (!state.ownerId) state.ownerId = getClientId();
+    if (!state.inviteId) state.inviteId = createLocalId("invite");
+    return state.inviteId;
+  }
+
+  function normalizeCloudDocument(response) {
+    const data = response && response.data;
+    return Array.isArray(data) ? data[0] || null : data || null;
+  }
+
+  function getSyncErrorMessage(error) {
+    const message = error && error.message ? error.message : "";
+    if (/scope|anonymous|login|domain|cors|origin/i.test(message)) {
+      return "请先在 CloudBase 开启匿名登录，并添加当前网页安全域名";
+    }
+    if (/collection|not exist|DATABASE_COLLECTION_NOT_EXIST/i.test(message)) {
+      return `请先创建云数据库集合 ${INVITE_COLLECTION}`;
+    }
+    return message || "云端同步暂不可用";
+  }
+
+  async function initCloudSync() {
+    if (cloudSync.readyPromise) return cloudSync.readyPromise;
+    cloudSync.readyPromise = (async () => {
+      if (!window.cloudbase) throw new Error("云端同步组件未加载");
+      cloudSync.app = window.cloudbase.init({ env: CLOUDBASE_ENV_ID });
+      const auth = cloudSync.app.auth();
+      await auth.anonymousAuthProvider().signIn();
+      cloudSync.db = cloudSync.app.database();
+      cloudSync.command = cloudSync.db.command;
+      state.syncStatus = "online";
+      state.syncError = "";
+      return cloudSync;
+    })().catch((error) => {
+      cloudSync.readyPromise = null;
+      state.syncStatus = "error";
+      state.syncError = getSyncErrorMessage(error);
+      throw error;
+    });
+    return cloudSync.readyPromise;
+  }
+
+  async function getInviteRecord(inviteId) {
+    await initCloudSync();
+    const response = await cloudSync.db.collection(INVITE_COLLECTION).doc(inviteId).get();
+    return normalizeCloudDocument(response);
+  }
+
+  async function ensureInviteRecord() {
+    if (!state.result) return null;
+    const inviteId = ensureInviteIdentity();
+    let record = await getInviteRecord(inviteId);
+    if (record) return record;
+    await cloudSync.db.collection(INVITE_COLLECTION).doc(inviteId).set({
+      inviteId,
+      ownerId: state.ownerId,
+      resultId: state.result.resultId,
+      themeId: state.result.themeId,
+      blessers: [],
+      createdAt: new Date(),
+      updatedAt: new Date()
+    });
+    return getInviteRecord(inviteId);
+  }
+
+  function markInviteUnlocked() {
+    if (state.isUnlocked || !state.result) return false;
+    state.isUnlocked = true;
+    state.step = "result";
+    pushHistory(state.result, "friends");
+    return true;
+  }
+
+  async function refreshInviteProgress(options = {}) {
+    if (!state.result || !state.inviteId) return false;
+    const previousCount = state.blessingCount;
+    const previousStatus = state.syncStatus;
+    try {
+      state.syncStatus = "syncing";
+      const record = await ensureInviteRecord();
+      const blessers = record && Array.isArray(record.blessers) ? record.blessers : [];
+      state.blessingCount = Math.min(blessers.length, REQUIRED_BLESSING_COUNT);
+      state.syncStatus = "online";
+      state.syncError = "";
+      const unlockedNow = state.blessingCount >= REQUIRED_BLESSING_COUNT && markInviteUnlocked();
+      const changed = unlockedNow || previousCount !== state.blessingCount || previousStatus !== state.syncStatus;
+      saveState();
+      if (options.render !== false && changed) render();
+      return changed;
+    } catch (error) {
+      console.warn("[invite-sync] refresh failed", error);
+      state.syncStatus = "error";
+      state.syncError = getSyncErrorMessage(error);
+      if (options.render !== false && previousStatus !== "error") render();
+      return false;
+    }
+  }
+
+  async function addCloudBlessing() {
+    if (!state.inviteId) throw new Error("邀请链接缺少进度标识，请让好友使用最新链接");
+    const clientId = getClientId();
+    if (state.ownerId === clientId) throw new Error("发起者不能为自己的祝符加持");
+    const record = await ensureInviteRecord();
+    const existingBlessers = record && Array.isArray(record.blessers) ? record.blessers : [];
+    if (existingBlessers.includes(clientId)) return { duplicate: true, count: existingBlessers.length };
+    await cloudSync.db.collection(INVITE_COLLECTION).doc(state.inviteId).update({
+      blessers: cloudSync.command.addToSet(clientId),
+      updatedAt: new Date()
+    });
+    const updated = await getInviteRecord(state.inviteId);
+    const blessers = updated && Array.isArray(updated.blessers) ? updated.blessers : [];
+    return { duplicate: false, count: blessers.length };
+  }
+
+  function stopProgressPolling() {
+    if (cloudSync.pollTimer) clearInterval(cloudSync.pollTimer);
+    cloudSync.pollTimer = null;
+  }
+
+  function startProgressPolling() {
+    stopProgressPolling();
+    const shouldPoll = state.result && state.inviteId && !state.isUnlocked && ["result", "invite"].includes(state.step);
+    if (!shouldPoll) return;
+    refreshInviteProgress();
+    cloudSync.pollTimer = setInterval(() => refreshInviteProgress(), SYNC_POLL_INTERVAL);
+  }
 
   function escapeHtml(value) {
     return String(value == null ? "" : value)
@@ -121,7 +282,10 @@
       birthday: state.birthday,
       birthdayDisplay: state.birthdayDisplay,
       resultId: state.result && state.result.resultId,
-      isUnlocked: state.isUnlocked
+      isUnlocked: state.isUnlocked,
+      ownerId: state.ownerId,
+      inviteId: state.inviteId,
+      blessingCount: state.blessingCount
     }));
   }
 
@@ -138,6 +302,9 @@
       state.birthdayDisplay = cached.birthdayDisplay || "";
       state.result = result;
       state.isUnlocked = Boolean(cached.isUnlocked);
+      state.ownerId = cached.ownerId || "";
+      state.inviteId = cached.inviteId || "";
+      state.blessingCount = Number(cached.blessingCount || 0);
     } catch (error) {
       console.warn(error);
     }
@@ -176,6 +343,7 @@
     state.selectedThemeId = result.themeId;
     state.themeIndex = themeIndex >= 0 ? themeIndex : 0;
     state.ownerId = (payload && (payload.o || payload.ownerId)) || params.get("ownerId") || params.get("from") || "";
+    state.inviteId = (payload && (payload.i || payload.inviteId)) || params.get("inviteId") || params.get("i") || "";
 
     if (mode === "public") {
       state.step = "publicResult";
@@ -196,6 +364,7 @@
 
   function createShareUrl(mode) {
     if (!state.result) return "";
+    if (mode === "bless") ensureInviteIdentity();
     const url = new URL(window.location.href);
     const targetFile = mode === "public" ? "charm.html" : "invite.html";
     url.pathname = url.pathname.replace(/[^/]*$/, targetFile);
@@ -206,7 +375,8 @@
       p: "xinxiang-shicheng",
       t: mode || "bless",
       r: state.result.resultId,
-      o: state.ownerId || ""
+      o: state.ownerId || "",
+      i: mode === "bless" ? state.inviteId : ""
     }));
     return url.toString();
   }
@@ -296,6 +466,7 @@
 
   function pushHistory(result, method) {
     const records = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+    if (records.some((item) => item.resultId === result.resultId && item.method === method)) return;
     records.unshift({
       id: `${Date.now()}`,
       resultId: result.resultId,
@@ -540,6 +711,9 @@
   function renderInvite() {
     const result = state.result;
     const blessUrl = createShareUrl("bless");
+    const count = Math.min(state.blessingCount || 0, REQUIRED_BLESSING_COUNT);
+    const remain = Math.max(REQUIRED_BLESSING_COUNT - count, 0);
+    const syncLabel = state.syncStatus === "error" ? "同步未连接" : state.syncStatus === "online" ? "云端已同步" : "云端同步中";
     app.innerHTML = `
       ${topbar("好友祝福解锁")}
       <section class="step">
@@ -547,10 +721,11 @@
           <span class="kicker">好友祝福解锁</span>
           <span class="flow-title">我的${escapeHtml(result.ganzhiName)}·${escapeHtml(result.charmName)}加载中</span>
           <div class="meta-grid">
-            <div class="meta-cell"><span>祝福进度</span><strong>0/3</strong></div>
-            <div class="meta-cell"><span>方式</span><strong>网页模拟</strong></div>
+            <div class="meta-cell"><span>祝福进度</span><strong>${count}/${REQUIRED_BLESSING_COUNT}</strong></div>
+            <div class="meta-cell"><span>状态</span><strong>${syncLabel}</strong></div>
           </div>
-          <span class="flow-copy">还需要 3 位好友的加持即可解锁。</span>
+          <span class="flow-copy">${remain ? `还需要 ${remain} 位好友的加持即可解锁。` : "祝福已集齐，正在解锁完整结果。"}</span>
+          ${state.syncStatus === "error" ? `<span class="result-subtitle">${escapeHtml(state.syncError || "暂时无法读取好友进度，请稍后重试。")}</span>` : ""}
         </div>
         <div class="share-link-card">
           <span class="share-link-title">心象事成邀请链接</span>
@@ -559,6 +734,7 @@
         </div>
         <div class="actions">
           <button class="primary" data-action="share-bless-link">分享/复制加持链接</button>
+          <button class="secondary" data-action="refresh-progress">刷新祝福进度</button>
           <button class="secondary" data-action="preview-bless-link">预览好友加持页</button>
           <button class="secondary" data-action="result">返回未解锁页</button>
         </div>
@@ -628,16 +804,17 @@
   function render() {
     saveState();
     document.body.className = `page-${state.step}`;
-    if (state.step === "home") return renderHome();
-    if (state.step === "theme") return renderTheme();
-    if (state.step === "birthday") return renderBirthday();
-    if (state.step === "loading") return renderLoading();
-    if (state.step === "result") return state.isUnlocked ? renderUnlockedResult(state.result) : renderLockedResult(state.result);
-    if (state.step === "invite") return renderInvite();
-    if (state.step === "bless") return renderBless();
-    if (state.step === "publicResult") return renderPublicResult();
-    if (state.step === "history") return renderHistory();
-    renderHome();
+    if (state.step === "home") renderHome();
+    else if (state.step === "theme") renderTheme();
+    else if (state.step === "birthday") renderBirthday();
+    else if (state.step === "loading") renderLoading();
+    else if (state.step === "result") state.isUnlocked ? renderUnlockedResult(state.result) : renderLockedResult(state.result);
+    else if (state.step === "invite") renderInvite();
+    else if (state.step === "bless") renderBless();
+    else if (state.step === "publicResult") renderPublicResult();
+    else if (state.step === "history") renderHistory();
+    else renderHome();
+    startProgressPolling();
   }
 
   function toast(text) {
@@ -668,6 +845,20 @@
   }
 
   async function shareOrCopyLink(mode) {
+    if (mode === "bless") {
+      try {
+        state.syncStatus = "syncing";
+        await ensureInviteRecord();
+        state.syncStatus = "online";
+        state.syncError = "";
+      } catch (error) {
+        state.syncStatus = "error";
+        state.syncError = error && error.message ? error.message : "云端邀请创建失败";
+        toast("邀请进度尚未连接，请稍后重试");
+        render();
+        return;
+      }
+    }
     const url = createShareUrl(mode);
     if (!url) return;
     const title = mode === "public" ? "我的心象祝符" : "帮我加持心象祝符";
@@ -863,6 +1054,11 @@
     }
     state.result = result;
     state.isUnlocked = false;
+    state.ownerId = getClientId();
+    state.inviteId = createLocalId("invite");
+    state.blessingCount = 0;
+    state.syncStatus = "idle";
+    state.syncError = "";
     state.step = "loading";
     render();
   }
@@ -897,6 +1093,7 @@
     }
     if (action === "generate") return generateResult();
     if (action === "invite") {
+      ensureInviteIdentity();
       state.step = "invite";
       return render();
     }
@@ -907,10 +1104,22 @@
     if (action === "share-bless-link") return shareOrCopyLink("bless");
     if (action === "share-public-link") return shareOrCopyLink("public");
     if (action === "select-share-link") return selectShareLink();
+    if (action === "refresh-progress") return refreshInviteProgress();
     if (action === "complete-bless") {
-      toast("已为 TA 添一份加持");
-      state.step = "publicResult";
-      return render();
+      target.disabled = true;
+      target.textContent = "正在送达祝福";
+      return addCloudBlessing()
+        .then((result) => {
+          toast(result.duplicate ? "你已经为 TA 加持过" : "已为 TA 添一份加持");
+          state.step = "publicResult";
+          render();
+        })
+        .catch((error) => {
+          console.warn("[invite-sync] bless failed", error);
+          target.disabled = false;
+          target.textContent = "为 TA 加持祝符";
+          toast(error && error.message ? error.message : "祝福未能同步，请稍后重试");
+        });
     }
     if (action === "send-blessing") return sendBlessing();
     if (action === "download-image" && state.result) {
@@ -923,6 +1132,9 @@
     if (action === "restart") {
       state.step = "theme";
       state.isUnlocked = false;
+      state.ownerId = "";
+      state.inviteId = "";
+      state.blessingCount = 0;
       return render();
     }
     if (action === "result") {
@@ -948,6 +1160,10 @@
     const target = event.target.closest("[data-action]");
     if (!target) return;
     handleAction(target.dataset.action, target);
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshInviteProgress();
   });
 
   loadData()
